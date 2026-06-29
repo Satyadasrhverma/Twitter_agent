@@ -66,12 +66,17 @@ _SEARCH_TITLE_RE = re.compile(r"^(.+?)\s*\(@[^)]+\)")
 
 
 class MonitorThread(threading.Thread):
-    """Runs the full async monitoring stack in a background thread."""
+    """Runs the full async monitoring stack in a background thread.
 
-    def __init__(self, state: AppState, notifier: ToastNotifier) -> None:
-        super().__init__(daemon=True, name="monitor-thread")
+    user_id=0 is the legacy single-user mode.
+    user_id>0 uses per-user session files and DB rows.
+    """
+
+    def __init__(self, state: AppState, notifier: ToastNotifier, user_id: int = 0) -> None:
+        super().__init__(daemon=True, name=f"monitor-{user_id}")
         self._state    = state
         self._notifier = notifier
+        self._user_id  = user_id
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._scheduler: Optional[Scheduler] = None
         self._pool: Optional[BrowserPool] = None
@@ -93,27 +98,22 @@ class MonitorThread(threading.Thread):
         self._state.is_monitoring = True
         self._state.started_at    = datetime.now(timezone.utc)
 
-        db = Database()
+        db = Database(owner_id=self._user_id)
         await db.connect()
 
-        # Auto-import Twitter session from Edge/Chrome on every startup.
-        # This means the user never has to click "Import" manually — as long
-        # as they stay logged in to x.com in their browser, it just works.
-        try:
-            ok, src = await asyncio.to_thread(auth.import_from_browser)
-            if ok:
-                _logger.info("Auto-imported Twitter session from %s on startup", src)
-            else:
-                _logger.info("Auto-import skipped (%s) — using stored session if available", src)
-        except Exception as exc:
-            _logger.debug("Auto-import on startup failed: %s", exc)
-
         while True:
-            session = auth.SESSION_PATH if auth.session_exists() else None
+            # Determine which session file to use for this user
+            if self._user_id > 0:
+                s_path = auth.get_user_session_path(self._user_id)
+                session = s_path if auth.session_exists_for(self._user_id) else None
+            else:
+                session = auth.SESSION_PATH if auth.session_exists() else None
+
+            users = self._state.get_monitored_users()
             async with BrowserPool(pool_size=config.WORKER_COUNT, session_path=session) as pool:
                 self._pool = pool
                 self._scheduler = Scheduler(
-                    users        = config.MONITORED_USERS,
+                    users        = users,
                     browser_pool = pool,
                     database     = db,
                     notifier     = self._notifier,
@@ -133,19 +133,28 @@ class MonitorThread(threading.Thread):
 
             self._pool = None
 
-            if auth.consume_session_reload():
-                _logger.info("New Twitter session detected — reloading browser pool…")
-                continue  # restart the loop with the new session
+            # Check for reload flag (per-user or global)
+            if self._user_id > 0:
+                reload = auth.consume_user_session_reload(self._user_id)
+            else:
+                reload = auth.consume_session_reload()
+
+            if reload:
+                _logger.info("New Twitter session detected (user=%d) — reloading pool…", self._user_id)
+                continue
             break
 
         await db.close()
         self._state.is_monitoring = False
 
     async def _watch_for_session_reload(self, scheduler: Scheduler) -> None:
-        """Trigger a browser pool reload when a new Twitter session is saved."""
         while True:
             await asyncio.sleep(5)
-            if auth.check_session_reload():
+            if self._user_id > 0:
+                flag = auth.check_user_session_reload(self._user_id)
+            else:
+                flag = auth.check_session_reload()
+            if flag:
                 await scheduler.shutdown()
                 return
 
@@ -285,6 +294,51 @@ class MonitorThread(threading.Thread):
                 return {"username": username, "display_name": None, "found": True}
         except Exception as exc:
             return {"username": username, "found": False, "reason": str(exc)}
+
+
+# ── Multi-user monitor manager ───────────────────────────────────────────────
+
+class UserMonitorManager:
+    """
+    Creates and owns one (AppState, MonitorThread) pair per app-user.
+    Thread-safe — can be called from the web server thread.
+    """
+
+    def __init__(self, notifier: ToastNotifier) -> None:
+        self._notifier = notifier
+        self._states:   dict[int, AppState]      = {}
+        self._monitors: dict[int, MonitorThread] = {}
+        self._lock = threading.Lock()
+
+    def get_state(self, user_id: int) -> AppState:
+        with self._lock:
+            if user_id not in self._states:
+                self._states[user_id] = AppState(user_id=user_id)
+            return self._states[user_id]
+
+    def ensure_running(self, user_id: int) -> MonitorThread:
+        """Return the running MonitorThread for user_id, starting it if needed."""
+        with self._lock:
+            if user_id not in self._monitors or not self._monitors[user_id].is_alive():
+                state   = self._states.get(user_id) or AppState(user_id=user_id)
+                self._states[user_id]   = state
+                monitor = MonitorThread(state, self._notifier, user_id=user_id)
+                monitor.start()
+                self._monitors[user_id] = monitor
+            return self._monitors[user_id]
+
+    def get_monitor(self, user_id: int) -> Optional[MonitorThread]:
+        with self._lock:
+            m = self._monitors.get(user_id)
+            return m if (m and m.is_alive()) else None
+
+    def stop_all(self) -> None:
+        with self._lock:
+            for m in self._monitors.values():
+                try:
+                    m.stop()
+                except Exception:
+                    pass
 
 
 # ── Dashboard Window ─────────────────────────────────────────────────────────

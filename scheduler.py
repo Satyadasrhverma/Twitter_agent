@@ -7,6 +7,7 @@ sleep until next cycle → repeat.
 
 import asyncio
 import logging
+import socket
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -24,6 +25,17 @@ except ImportError:
     _AppState = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
+
+_NET_ERRORS = ("ERR_INTERNET_DISCONNECTED", "ERR_NETWORK_CHANGED", "ERR_NAME_NOT_RESOLVED")
+
+
+def _is_connected() -> bool:
+    try:
+        socket.setdefaulttimeout(3)
+        socket.create_connection(("8.8.8.8", 53)).close()
+        return True
+    except OSError:
+        return False
 
 
 class Scheduler:
@@ -158,7 +170,25 @@ class Scheduler:
                     logger.warning("Check timed out for @%s — skipping this cycle", username)
                     self.error_count += 1
 
+        _offline_logged = False
+
         while not self._shutdown_event.is_set():
+            # Pause silently when internet is down — retry every 10s
+            if not await asyncio.to_thread(_is_connected):
+                if not _offline_logged:
+                    logger.warning("Internet disconnected — monitoring paused, will resume automatically")
+                    _offline_logged = True
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=10.0)
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            if _offline_logged:
+                logger.info("Internet restored — resuming monitoring")
+                _offline_logged = False
+
             cycle_start = asyncio.get_event_loop().time()
 
             current_users = self._state.get_monitored_users() if self._state else self._users

@@ -1,8 +1,6 @@
 """
-Thread-safe shared state between the monitoring backend and the GUI.
-All fields are read by the UI thread and written by the monitoring thread.
-Simple int/bool fields are safe to read without a lock under CPython's GIL.
-The detections deque uses appendleft() which is atomic in CPython.
+Thread-safe shared state between the monitoring backend and the web API.
+Each AppState instance is scoped to one app-user (owner_id).
 """
 
 import json
@@ -15,23 +13,27 @@ from typing import Optional
 
 import config
 
-_USERS_FILE = os.path.join("data", "users_list.json")
+
+def _users_file(user_id: int) -> str:
+    return os.path.join("data", "sessions", f"user_{user_id}", "users_list.json")
 
 
-def _load_users() -> list[str]:
+def _load_users(user_id: int) -> list[str]:
+    path = _users_file(user_id)
     try:
-        if os.path.exists(_USERS_FILE):
-            with open(_USERS_FILE, encoding="utf-8") as f:
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
                 return [str(u) for u in json.load(f).get("users", []) if u]
     except Exception:
         pass
     return []
 
 
-def _save_users(users: list[str]) -> None:
-    os.makedirs(os.path.dirname(_USERS_FILE), exist_ok=True)
+def _save_users(user_id: int, users: list[str]) -> None:
+    path = _users_file(user_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     try:
-        with open(_USERS_FILE, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump({"users": users}, f, indent=2)
     except Exception:
         pass
@@ -40,52 +42,44 @@ def _save_users(users: list[str]) -> None:
 @dataclass
 class Detection:
     """One new-post event shown in the Detections tab."""
-
-    username: str
+    username:     str
     display_name: Optional[str]
-    post_url: str
-    detected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    post_url:     str
+    detected_at:  datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 @dataclass
 class UserStatus:
     """Per-user monitoring status shown in the Users tab."""
-
-    username: str
+    username:     str
     last_checked: Optional[datetime] = None
-    last_post_id: Optional[str] = None
-    ok: bool = True
+    last_post_id: Optional[str]      = None
+    ok:           bool               = True
 
 
 class AppState:
     """
-    Central shared state.  Written by monitoring thread, read by UI thread.
-    Use update_user() and add_detection() — they are thread-safe.
+    Central shared state for one app-user.
+    Written by monitoring thread, read by web API thread.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, user_id: int = 0) -> None:
+        self.user_id = user_id
+
         self.is_monitoring: bool = False
         self.started_at: Optional[datetime] = None
 
-        # Counters — mirrored from Scheduler after each cycle
-        self.checked_count: int = 0
+        self.checked_count:   int = 0
         self.new_posts_count: int = 0
-        self.error_count: int = 0
+        self.error_count:     int = 0
 
-        # Recent detections (newest first, capped at 50)
-        self.detections: deque[Detection] = deque(maxlen=50)
+        self.detections:    deque[Detection]          = deque(maxlen=50)
+        self.user_statuses: dict[str, UserStatus]     = {}
 
-        # Per-user status dict  { "openai": UserStatus, ... }
-        self.user_statuses: dict[str, UserStatus] = {}
+        _saved = _load_users(user_id)
+        self._monitored_users: list[str] = _saved if _saved else []
 
-        # Managed user list (source of truth for add/remove)
-        # Load from saved file first; fall back to hardcoded config
-        _saved = _load_users()
-        self._monitored_users: list[str] = _saved if _saved else list(config.MONITORED_USERS)
-
-        # Display names discovered via search or scraping
         self._display_names: dict[str, str] = {}
-
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -112,10 +106,9 @@ class AppState:
             )
 
     def sync_from_scheduler(self, scheduler: object) -> None:
-        """Copy counter values from a Scheduler instance (no lock needed for ints)."""
-        self.checked_count = getattr(scheduler, "checked_count", 0)
+        self.checked_count   = getattr(scheduler, "checked_count",   0)
         self.new_posts_count = getattr(scheduler, "new_posts_count", 0)
-        self.error_count = getattr(scheduler, "error_count", 0)
+        self.error_count     = getattr(scheduler, "error_count",     0)
 
     # ------------------------------------------------------------------
     # Monitored user list management
@@ -126,7 +119,6 @@ class AppState:
             return list(self._monitored_users)
 
     def add_user(self, username: str, display_name: Optional[str] = None) -> tuple[bool, str]:
-        """Add a user. Returns (success, reason)."""
         username = username.strip().lstrip("@")
         if not username:
             return False, "Empty username"
@@ -137,21 +129,18 @@ class AppState:
             if len(self._monitored_users) >= config.MAX_MONITORED_USERS:
                 return False, f"Limit of {config.MAX_MONITORED_USERS} users reached"
             self._monitored_users.append(username)
-            config.MONITORED_USERS = list(self._monitored_users)
             if display_name:
                 self._display_names[username.lower()] = display_name
-            _save_users(self._monitored_users)
-            return True, "ok"
+            _save_users(self.user_id, self._monitored_users)
+        return True, "ok"
 
     def remove_user(self, username: str) -> bool:
-        """Remove a user. Returns True if removed."""
         username_lower = username.lower()
         with self._lock:
             before = len(self._monitored_users)
             self._monitored_users = [u for u in self._monitored_users if u.lower() != username_lower]
-            config.MONITORED_USERS = list(self._monitored_users)
-            _save_users(self._monitored_users)
-            return len(self._monitored_users) < before
+            _save_users(self.user_id, self._monitored_users)
+        return len(self._monitored_users) < before
 
     def set_display_name(self, username: str, display_name: str) -> None:
         with self._lock:
@@ -162,7 +151,7 @@ class AppState:
             return self._display_names.get(username.lower())
 
     # ------------------------------------------------------------------
-    # Read helpers (called from UI thread)
+    # Read helpers
     # ------------------------------------------------------------------
 
     def get_detections_snapshot(self) -> list[Detection]:

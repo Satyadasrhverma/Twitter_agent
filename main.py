@@ -19,24 +19,27 @@ def run() -> None:
     import logger as log_setup
     log_setup.setup_logging()
 
-    from ui_state import AppState
+    import app_auth
     from notifier import ToastNotifier
+    from gui import UserMonitorManager
+    from web import start_server, PORT
 
-    state    = AppState()
-    notifier = ToastNotifier()
+    app_auth.init_tables()
 
-    # Start async monitoring in background thread
-    from gui import MonitorThread
-    monitor = MonitorThread(state, notifier)
-    monitor.start()
-    _logger.info("Monitoring started — %d users, %d workers",
-                 len(__import__('config').MONITORED_USERS),
-                 __import__('config').WORKER_COUNT)
+    notifier     = ToastNotifier()
+    user_manager = UserMonitorManager(notifier)
+
+    # Start monitoring for every already-registered app user
+    for u in app_auth.get_all_users():
+        try:
+            user_manager.ensure_running(u["id"])
+            _logger.info("Started monitor for app user '%s' (id=%d)", u.get("email", u.get("username", "?")), u["id"])
+        except Exception as exc:
+            _logger.warning("Could not start monitor for user %d: %s", u["id"], exc)
 
     # Start web server + open browser
-    from web import start_server, PORT
-    start_server(state, monitor, open_browser=True)
-    _logger.info("Dashboard → http://localhost:%d", PORT)
+    start_server(user_manager, open_browser=True)
+    _logger.info("Dashboard -> http://localhost:%d", PORT)
 
     # Block main thread until Ctrl-C
     try:
@@ -48,6 +51,8 @@ def run() -> None:
                 time.sleep(1)
         except KeyboardInterrupt:
             pass
+
+    user_manager.stop_all()
 
 
 # ── Headless terminal mode ───────────────────────────────────────────────────
@@ -77,7 +82,6 @@ def run_headless() -> None:
                 notifier=notifier,
             )
 
-            # Windows-safe signal handling
             try:
                 loop = asyncio.get_running_loop()
                 for sig in (signal.SIGINT, signal.SIGTERM):

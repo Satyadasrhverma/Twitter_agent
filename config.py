@@ -6,9 +6,19 @@ Set overrides via environment variables (e.g. MONITOR_HEADLESS=false).
 import os
 from typing import Final
 
+from dotenv import load_dotenv
+load_dotenv()  # auto-loads .env file from project folder
+
 # All paths are resolved relative to this file's directory so the app works
 # no matter which directory it's launched from.
 _BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
+
+# ---------------------------------------------------------------------------
+# Google OAuth (set via environment variables or .env)
+# ---------------------------------------------------------------------------
+
+GOOGLE_CLIENT_ID: Final[str] = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET: Final[str] = os.getenv("GOOGLE_CLIENT_SECRET", "")
 
 # ---------------------------------------------------------------------------
 # Monitoring targets
@@ -17,14 +27,14 @@ _BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
 MONITORED_USERS: list[str] = []
 
 # Maximum users allowed
-MAX_MONITORED_USERS: Final[int] = 30
+MAX_MONITORED_USERS: Final[int] = 100
 
 # ---------------------------------------------------------------------------
 # Timing
 # ---------------------------------------------------------------------------
 
 # Seconds between full cycles (all users checked once = one cycle)
-CHECK_INTERVAL_SECONDS: Final[int] = int(os.getenv("MONITOR_INTERVAL", "15"))
+CHECK_INTERVAL_SECONDS: Final[int] = int(os.getenv("MONITOR_INTERVAL", "30"))
 
 # Max seconds to wait for a profile page to load
 PAGE_TIMEOUT_MS: Final[int] = int(os.getenv("MONITOR_PAGE_TIMEOUT_MS", "20000"))

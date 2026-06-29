@@ -1,46 +1,178 @@
 """
 Web dashboard server — http://localhost:8080
 FastAPI backend + single-page HTML/CSS/JS frontend.
+Multi-user: each request is authenticated via an x_session cookie.
 """
 
 import asyncio
+import json as _json
 import re as _re
 import sqlite3
 import threading
+import urllib.parse as _urlparse
 import urllib.request as _urllib
 import webbrowser
 from datetime import datetime, timezone
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 import uvicorn
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import Cookie, Depends, FastAPI, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
+import app_auth
 import auth
 import config
 from ui_state import AppState
 
+app_auth.init_tables()   # ensure app_users table exists
+
 # ── Globals set by start_server() ──────────────────────────────────────────
-_state:   Optional[AppState]  = None
-_monitor: Optional[Any]       = None   # MonitorThread | None
+_user_manager: Optional[Any] = None   # gui.UserMonitorManager | None
 
 app = FastAPI(title="X Monitor", docs_url=None, redoc_url=None)
 PORT = 8080
 
 
-# ── REST API ────────────────────────────────────────────────────────────────
+# ── Session dependency ──────────────────────────────────────────────────────
+
+async def _current_user(x_session: str = Cookie(None)) -> Optional[dict]:
+    """Return {user_id, username} for a valid session cookie, else None."""
+    if not x_session:
+        return None
+    return app_auth.get_session(x_session)
+
+
+
+def _get_state(user_id: int) -> AppState:
+    return _user_manager.get_state(user_id)  # type: ignore[union-attr]
+
+
+def _get_monitor(user_id: int) -> Optional[Any]:
+    return _user_manager.get_monitor(user_id)  # type: ignore[union-attr]
+
+
+# ── Routes ───────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
-async def index() -> str:
+async def index(user: Optional[dict] = Depends(_current_user)) -> str:
+    if not user:
+        return _LOGIN_HTML
     return _HTML
 
 
+@app.post("/app/logout")
+async def app_logout(response: Response, x_session: str = Cookie(None)) -> JSONResponse:
+    if x_session:
+        app_auth.logout(x_session)
+    response.delete_cookie("x_session")
+    return JSONResponse({"ok": True})
+
+
+# ── Google OAuth ──────────────────────────────────────────────────────────────
+
+_GOOGLE_AUTH_URL  = "https://accounts.google.com/o/oauth2/v2/auth"
+_GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+_GOOGLE_INFO_URL  = "https://www.googleapis.com/oauth2/v2/userinfo"
+
+
+def _google_redirect_uri() -> str:
+    return f"http://localhost:{PORT}/auth/google/callback"
+
+
+@app.get("/auth/google")
+async def google_login() -> RedirectResponse:
+    if not config.GOOGLE_CLIENT_ID:
+        return RedirectResponse("/?error=setup")
+    params = _urlparse.urlencode({
+        "client_id":     config.GOOGLE_CLIENT_ID,
+        "redirect_uri":  _google_redirect_uri(),
+        "response_type": "code",
+        "scope":         "openid email profile",
+        "access_type":   "offline",
+        "prompt":        "select_account",
+    })
+    return RedirectResponse(f"{_GOOGLE_AUTH_URL}?{params}")
+
+
+@app.get("/auth/google/callback")
+async def google_callback(
+    code:  Optional[str] = None,
+    error: Optional[str] = None,
+) -> RedirectResponse:
+    import logging as _log2
+    _logger = _log2.getLogger(__name__)
+
+    if error or not code:
+        _logger.error("Google callback: error=%s code_present=%s", error, bool(code))
+        return RedirectResponse("/?error=cancelled")
+    try:
+        _logger.info("Google callback: exchanging code for token...")
+        token_data = _urlparse.urlencode({
+            "code":          code,
+            "client_id":     config.GOOGLE_CLIENT_ID,
+            "client_secret": config.GOOGLE_CLIENT_SECRET,
+            "redirect_uri":  _google_redirect_uri(),
+            "grant_type":    "authorization_code",
+        }).encode()
+        req = _urllib.Request(_GOOGLE_TOKEN_URL, data=token_data, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        with _urllib.urlopen(req, timeout=15) as r:
+            token_resp = _json.loads(r.read())
+
+        _logger.info("Token response keys: %s", list(token_resp.keys()))
+        access_token = token_resp.get("access_token", "")
+        if not access_token:
+            _logger.error("No access_token in response: %s", token_resp)
+            return RedirectResponse("/?error=failed")
+
+        _logger.info("Got access_token, fetching user info...")
+        info_req = _urllib.Request(
+            f"{_GOOGLE_INFO_URL}?access_token={_urlparse.quote(access_token)}"
+        )
+        with _urllib.urlopen(info_req, timeout=15) as r:
+            user_info = _json.loads(r.read())
+
+        google_id = user_info.get("id", "")
+        email     = user_info.get("email", "")
+        name      = user_info.get("name", "")
+        _logger.info("Google user: email=%s name=%s id_present=%s", email, name, bool(google_id))
+
+        if not google_id:
+            return RedirectResponse("/?error=failed")
+
+        token, user_id = await asyncio.to_thread(
+            app_auth.get_or_create_google_user, google_id, email, name
+        )
+        _logger.info("User saved: user_id=%d email=%s", user_id, email)
+        try:
+            if _user_manager:
+                _user_manager.ensure_running(user_id)
+        except Exception as e:
+            _logger.warning("Monitor start failed (non-fatal): %s", e)
+
+        resp = RedirectResponse("/", status_code=302)
+        resp.set_cookie("x_session", token, httponly=True, samesite="lax", max_age=86400 * 30)
+        return resp
+
+    except Exception as exc:
+        _logger.error("Google OAuth error: %s", exc, exc_info=True)
+        return RedirectResponse("/?error=failed")
+
+
+@app.get("/api/me")
+async def api_me(user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    return JSONResponse({"user_id": user["user_id"], "username": user["username"], "name": user.get("name", "")})
+
+
 @app.get("/api/status")
-async def get_status() -> JSONResponse:
-    if _state is None:
-        return JSONResponse({"error": "not ready"}, status_code=503)
-    s = _state
+async def get_status(user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    uid = user["user_id"]
+    s   = _get_state(uid)
     now = datetime.now(timezone.utc)
 
     uptime = "--"
@@ -88,14 +220,14 @@ async def get_status() -> JSONResponse:
 
 
 @app.get("/api/settings")
-async def get_settings() -> JSONResponse:
-    users = _state.get_monitored_users() if _state else config.MONITORED_USERS
+async def get_settings(user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
     return JSONResponse({
         "interval":  config.CHECK_INTERVAL_SECONDS,
         "workers":   config.WORKER_COUNT,
         "headless":  config.HEADLESS,
         "sound":     config.NOTIFICATION_SOUND,
-        "users":     users,
         "max_users": config.MAX_MONITORED_USERS,
     })
 
@@ -108,7 +240,9 @@ class SettingsIn(BaseModel):
 
 
 @app.post("/api/settings")
-async def save_settings(body: SettingsIn) -> JSONResponse:
+async def save_settings(body: SettingsIn, user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
     config.CHECK_INTERVAL_SECONDS = body.interval   # type: ignore[misc]
     config.WORKER_COUNT           = body.workers    # type: ignore[misc]
     config.HEADLESS               = body.headless   # type: ignore[misc]
@@ -134,7 +268,6 @@ _NAME_PAT  = _re.compile(r'^(.+?)\s*\(@[^)]+\)')
 
 
 async def _quick_search(username: str) -> Optional[dict]:
-    """Fast urllib lookup — reads just the page <title> (~2-3 sec, no browser)."""
     def _fetch():
         url = f"https://x.com/{username}"
         req = _urllib.Request(url, headers={
@@ -155,30 +288,32 @@ async def _quick_search(username: str) -> Optional[dict]:
             lower = html.lower()
             if "account suspended" in lower or "doesn't exist" in lower:
                 return {"username": username, "found": False, "reason": "Account not found or suspended"}
-            return None  # title didn't match pattern — fall back to browser
+            return None
         except Exception:
-            return None  # network error — fall back to browser
+            return None
     return await asyncio.to_thread(_fetch)
 
 
 @app.post("/api/users/search")
-async def search_user_endpoint(body: UsernameIn) -> JSONResponse:
+async def search_user_endpoint(body: UsernameIn, user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    uid     = user["user_id"]
+    monitor = _get_monitor(uid)
     try:
         query = body.username.strip().lstrip("@")
         if not query:
             return JSONResponse({"found": False, "reason": "Empty username"})
 
-        # ── Multi-result name search (logged-in session required) ──────────────
         has_space = " " in query
-        if auth.session_exists() and _monitor is not None and has_space:
+        if auth.session_exists_for(uid) and monitor is not None and has_space:
             try:
-                results = await asyncio.to_thread(_monitor.search_users_by_name, query)
+                results = await asyncio.to_thread(monitor.search_users_by_name, query)
                 if results:
                     return JSONResponse({"found": True, "multiple": True, "results": results})
             except Exception:
                 pass
 
-        # ── Single-user lookup — collect result then augment with latest post ──
         result: Optional[dict] = None
         try:
             result = await _quick_search(query)
@@ -186,20 +321,19 @@ async def search_user_endpoint(body: UsernameIn) -> JSONResponse:
             pass
 
         if result is None:
-            if _monitor is None:
+            if monitor is None:
                 return JSONResponse({"found": False, "reason": "Monitor not ready — try again in a moment"})
             try:
-                result = await asyncio.to_thread(_monitor.search_user, query)
+                result = await asyncio.to_thread(monitor.search_user, query)
             except Exception as exc:
                 return JSONResponse({"found": False, "reason": f"Search failed: {exc}"})
 
         if not result:
             return JSONResponse({"found": False, "reason": "User not found"})
 
-        # ── Augment with latest tweet ID (fast API path, logged-in only) ───────
-        if result.get("found") and _monitor is not None:
+        if result.get("found") and monitor is not None:
             try:
-                post = await asyncio.to_thread(_monitor.get_latest_post, result["username"])
+                post = await asyncio.to_thread(monitor.get_latest_post, result["username"])
                 if post:
                     result["latest_post_id"]  = post["post_id"]
                     result["latest_post_url"] = post["post_url"]
@@ -212,30 +346,32 @@ async def search_user_endpoint(body: UsernameIn) -> JSONResponse:
         return JSONResponse({"found": False, "reason": str(exc)})
 
 
-def _seed_tweet_sync(username: str, post_id: str, post_url: str) -> None:
-    """Write initial tweet ID to DB using sync sqlite (safe from any thread)."""
+def _seed_tweet_sync(owner_id: int, username: str, post_id: str, post_url: str) -> None:
     try:
         conn = sqlite3.connect(config.DB_PATH, timeout=5)
         conn.execute(
-            """INSERT INTO monitored_users (username, latest_post_id, latest_post_url)
-               VALUES (?, ?, ?) ON CONFLICT(username) DO NOTHING""",
-            (username.lower(), post_id, post_url),
+            """INSERT INTO monitored_users (owner_id, username, latest_post_id, latest_post_url)
+               VALUES (?, ?, ?, ?) ON CONFLICT(owner_id, username) DO NOTHING""",
+            (owner_id, username.lower(), post_id, post_url),
         )
         conn.commit()
         conn.close()
     except Exception as exc:
         import logging as _log
-        _log.getLogger(__name__).warning("Could not seed tweet ID for @%s: %s", username, exc)
+        _log.getLogger(__name__).warning("Could not seed tweet for @%s: %s", username, exc)
 
 
 @app.post("/api/users/add")
-async def add_user_endpoint(body: AddUserIn) -> JSONResponse:
-    if _state is None:
-        return JSONResponse({"ok": False, "reason": "Not ready"})
-    ok, reason = _state.add_user(body.username, body.display_name)
+async def add_user_endpoint(body: AddUserIn, user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    uid = user["user_id"]
+    s   = _get_state(uid)
+    ok, reason = s.add_user(body.username, body.display_name)
     if ok and body.initial_post_id:
         await asyncio.to_thread(
             _seed_tweet_sync,
+            uid,
             body.username,
             body.initial_post_id,
             body.initial_post_url or "",
@@ -243,48 +379,55 @@ async def add_user_endpoint(body: AddUserIn) -> JSONResponse:
     return JSONResponse({
         "ok":         ok,
         "reason":     reason,
-        "user_count": len(_state.get_monitored_users()),
+        "user_count": len(s.get_monitored_users()),
         "max_users":  config.MAX_MONITORED_USERS,
     })
 
 
 @app.delete("/api/users/{username}")
-async def remove_user_endpoint(username: str) -> JSONResponse:
-    if _state is None:
-        return JSONResponse({"ok": False})
-    removed = _state.remove_user(username)
-    return JSONResponse({"ok": removed, "user_count": len(_state.get_monitored_users())})
+async def remove_user_endpoint(username: str, user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    s = _get_state(user["user_id"])
+    removed = s.remove_user(username)
+    return JSONResponse({"ok": removed, "user_count": len(s.get_monitored_users())})
 
 
-# ── Twitter auth endpoints ───────────────────────────────────────────────────
+# ── Twitter auth endpoints (per-user) ────────────────────────────────────────
 
 @app.get("/api/auth/status")
-async def auth_status() -> JSONResponse:
+async def auth_status(user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    uid      = user["user_id"]
     login_st = auth.get_login_state()
     return JSONResponse({
-        "logged_in":        auth.session_exists(),
-        "username":         auth.get_session_username(),
+        "logged_in":         auth.session_exists_for(uid),
+        "username":          auth.get_session_username_for(uid),
         "login_in_progress": login_st["in_progress"],
-        "login_done":       login_st["done"],
-        "login_result":     login_st["result"],
+        "login_done":        login_st["done"],
+        "login_result":      login_st["result"],
     })
 
 
 @app.post("/api/auth/login")
-async def auth_login() -> JSONResponse:
+async def auth_login(user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
     started, msg = auth.start_login()
     return JSONResponse({"started": started, "message": msg})
 
 
 @app.post("/api/auth/logout")
-async def auth_logout() -> JSONResponse:
-    auth.clear_session()
+async def auth_logout(user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    auth.clear_session_for(user["user_id"])
     return JSONResponse({"ok": True})
 
 
 @app.post("/api/auth/cancel")
 async def auth_cancel() -> JSONResponse:
-    """Cancel an in-progress login attempt."""
     auth._set_state(in_progress=False, done=False, result=None)
     return JSONResponse({"ok": True})
 
@@ -295,38 +438,47 @@ class ManualCookieIn(BaseModel):
 
 
 @app.post("/api/auth/manual")
-async def auth_manual(body: ManualCookieIn) -> JSONResponse:
-    ok, result = await asyncio.to_thread(auth.save_manual_cookies, body.auth_token, body.ct0)
+async def auth_manual(body: ManualCookieIn, user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    uid = user["user_id"]
+    ok, result = await asyncio.to_thread(auth.save_manual_cookies_for, body.auth_token, body.ct0, uid)
     if ok:
+        # Reload the monitor so it picks up the new session
+        if _user_manager:
+            _user_manager.ensure_running(uid)
         return JSONResponse({"ok": True, "username": result})
     return JSONResponse({"ok": False, "reason": result})
 
 
 @app.post("/api/auth/import-browser")
-async def auth_import_browser() -> JSONResponse:
-    """Import Twitter session directly from Edge/Chrome browser cookies."""
+async def auth_import_browser(user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
     ok, reason = await asyncio.to_thread(auth.import_from_browser)
     return JSONResponse({"ok": ok, "reason": reason})
 
 
 class ControlIn(BaseModel):
-    action: str   # "stop"
+    action: str
 
 
 @app.post("/api/control")
-async def control(body: ControlIn) -> JSONResponse:
-    if body.action == "stop" and _monitor is not None:
-        _monitor.stop()
+async def control(body: ControlIn, user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    monitor = _get_monitor(user["user_id"])
+    if body.action == "stop" and monitor is not None:
+        monitor.stop()
         return JSONResponse({"ok": True})
     return JSONResponse({"ok": False, "reason": "unknown action"})
 
 
 # ── Server lifecycle ────────────────────────────────────────────────────────
 
-def start_server(state: AppState, monitor: Any, open_browser: bool = True) -> threading.Thread:
-    global _state, _monitor
-    _state   = state
-    _monitor = monitor
+def start_server(user_manager: Any, open_browser: bool = True) -> threading.Thread:
+    global _user_manager
+    _user_manager = user_manager
 
     cfg = uvicorn.Config(app, host="127.0.0.1", port=PORT,
                          log_level="error", loop="asyncio")
@@ -357,6 +509,103 @@ def _ago(dt: Optional[datetime]) -> str:
     if s < 3600:  return f"{s//60}m ago"
     if s < 86400: return f"{s//3600}h ago"
     return f"{s//86400}d ago"
+
+
+# ── Login / Register page ────────────────────────────────────────────────────
+
+_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>X Monitor</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:#000;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;align-items:center;justify-content:center;padding:20px}
+.card{background:#16181c;border:1px solid #2f3336;border-radius:20px;padding:48px 40px;width:100%;max-width:380px;box-shadow:0 24px 80px rgba(0,0,0,.7);text-align:center}
+.logo{width:56px;height:56px;border-radius:50%;background:#1d9bf0;display:grid;place-items:center;font-size:28px;font-weight:900;color:#fff;margin:0 auto 20px}
+h1{color:#e7e9ea;font-size:22px;font-weight:800;margin-bottom:6px}
+.sub{color:#71767b;font-size:14px;margin-bottom:32px}
+.btn-google{display:flex;align-items:center;justify-content:center;gap:12px;width:100%;padding:14px 20px;border-radius:12px;background:#fff;color:#1f1f1f;font-size:15px;font-weight:600;border:none;cursor:pointer;transition:.15s;text-decoration:none}
+.btn-google:hover{background:#f1f3f4;box-shadow:0 2px 8px rgba(0,0,0,.25)}
+.btn-google:active{background:#e8eaed}
+.btn-google.loading{opacity:.7;pointer-events:none}
+.err{margin-top:20px;background:rgba(244,33,46,.12);border:1px solid rgba(244,33,46,.3);border-radius:10px;padding:12px 16px;color:#f4212e;font-size:13px;line-height:1.5;display:none}
+.setup-box{margin-top:20px;background:rgba(29,155,240,.08);border:1px solid rgba(29,155,240,.2);border-radius:12px;padding:16px;text-align:left}
+.setup-box h3{color:#e7e9ea;font-size:13px;font-weight:700;margin-bottom:8px}
+.setup-box p{color:#71767b;font-size:12px;line-height:1.6}
+.setup-box code{background:rgba(255,255,255,.08);padding:2px 6px;border-radius:4px;font-size:11px;color:#e7e9ea}
+.spinner{display:inline-block;width:16px;height:16px;border:2px solid rgba(0,0,0,.15);border-top-color:#1d9bf0;border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">&#120143;</div>
+  <h1>X Monitor</h1>
+  <p class="sub">Sign in to access your dashboard</p>
+
+  <a class="btn-google" id="btn" href="/auth/google" onclick="loading(event)">
+    <svg width="20" height="20" viewBox="0 0 24 24" style="flex-shrink:0">
+      <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+      <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+      <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/>
+      <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+    </svg>
+    Continue with Google
+  </a>
+
+  <div class="err" id="err"></div>
+  <div class="setup-box" id="setup-box" style="display:none">
+    <h3>&#9888; Google sign-in is not configured</h3>
+    <p>Add your credentials to a <code>.env</code> file in the project folder:<br><br>
+    <code>GOOGLE_CLIENT_ID=your_client_id</code><br>
+    <code>GOOGLE_CLIENT_SECRET=your_secret</code><br><br>
+    Get these from <b style="color:#e7e9ea">Google Cloud Console</b> → APIs &amp; Services → Credentials → OAuth 2.0.<br>
+    Set redirect URI to: <code>http://localhost:8080/auth/google/callback</code></p>
+  </div>
+</div>
+<script>
+const _BTN_HTML = document.getElementById('btn').innerHTML;
+
+function loading(e) {
+  const btn = document.getElementById('btn');
+  btn.classList.add('loading');
+  btn.innerHTML = '<span class="spinner"></span> Redirecting…';
+}
+
+function resetBtn() {
+  const btn = document.getElementById('btn');
+  btn.classList.remove('loading');
+  btn.innerHTML = _BTN_HTML;
+}
+
+// Reset button if user navigates back (bfcache restore)
+window.addEventListener('pageshow', function(e) {
+  if (e.persisted) resetBtn();
+});
+
+// Safety timeout — reset after 10s if redirect never happened
+document.getElementById('btn').addEventListener('click', function() {
+  setTimeout(resetBtn, 10000);
+});
+
+(function(){
+  const err = new URLSearchParams(location.search).get('error');
+  if (!err) return;
+  if (err === 'setup') {
+    document.getElementById('setup-box').style.display = 'block';
+    return;
+  }
+  const el = document.getElementById('err');
+  el.style.display = 'block';
+  el.textContent = err === 'cancelled'
+    ? 'Sign-in was cancelled. Please try again.'
+    : 'Google sign-in failed — please try again.';
+})();
+</script>
+</body>
+</html>"""
 
 
 # ── Single-page HTML/CSS/JS ─────────────────────────────────────────────────
@@ -739,6 +988,10 @@ textarea { resize: vertical; line-height: 1.6 }
       <div class="status-dot live pulse" id="sb-dot"></div>
       <span id="sb-status" style="font-size:13px;font-weight:600;color:var(--green)">LIVE</span>
     </div>
+    <div style="margin-top:10px;padding:10px 12px;background:var(--card);border:1px solid var(--border);border-radius:10px">
+      <div style="font-size:12px;font-weight:700;color:var(--white)" id="app-user-chip">—</div>
+      <button onclick="appLogout()" style="font-size:11px;color:var(--gray);background:none;border:none;padding:2px 0;cursor:pointer;margin-top:2px">↩ Logout</button>
+    </div>
   </div>
 </nav>
 
@@ -841,24 +1094,24 @@ textarea { resize: vertical; line-height: 1.6 }
       <!-- Connected state -->
       <div id="auth-connected" style="display:none;padding:18px;align-items:center;gap:14px">
         <div id="auth-info" style="flex:1;font-size:14px;font-weight:600;color:var(--green)"></div>
-        <button class="btn btn-ghost btn-sm" onclick="doLogout()">Disconnect</button>
+        <button class="btn btn-ghost btn-sm" onclick="disconnectTwitter()">Disconnect</button>
       </div>
       <!-- Not connected — show manual form directly -->
       <div id="auth-form" style="padding:18px">
         <div style="font-size:13px;color:var(--gray-light);margin-bottom:14px;line-height:1.8">
-          Edge/Chrome mein <b style="color:var(--white)">x.com</b> pe login karo → <b style="color:var(--white)">F12</b> dabao → <b style="color:var(--white)">Application</b> → <b style="color:var(--white)">Cookies</b> → <b style="color:var(--white)">https://x.com</b> → neeche se copy karo:
+          Open <b style="color:var(--white)">x.com</b> in Edge/Chrome → Press <b style="color:var(--white)">F12</b> → Go to <b style="color:var(--white)">Application</b> tab → <b style="color:var(--white)">Cookies</b> → <b style="color:var(--white)">https://x.com</b> → copy the values below:
         </div>
         <div style="display:flex;flex-direction:column;gap:10px;max-width:560px">
           <div>
             <div style="font-size:11px;color:var(--gray);margin-bottom:4px;font-weight:700;letter-spacing:.05em">AUTH_TOKEN</div>
-            <input type="password" id="mc-auth" placeholder="auth_token value yahan paste karo" style="width:100%;font-family:monospace;font-size:12px" autocomplete="off"/>
+            <input type="password" id="mc-auth" placeholder="Paste auth_token value here" style="width:100%;font-family:monospace;font-size:12px" autocomplete="off"/>
           </div>
           <div>
             <div style="font-size:11px;color:var(--gray);margin-bottom:4px;font-weight:700;letter-spacing:.05em">CT0</div>
-            <input type="text" id="mc-ct0" placeholder="ct0 value yahan paste karo" style="width:100%;font-family:monospace;font-size:12px" autocomplete="off"/>
+            <input type="text" id="mc-ct0" placeholder="Paste ct0 value here" style="width:100%;font-family:monospace;font-size:12px" autocomplete="off"/>
           </div>
           <div style="display:flex;align-items:center;gap:12px;margin-top:4px">
-            <button class="btn btn-blue" id="mc-btn" onclick="doManualConnect()">✅ Connect Karo</button>
+            <button class="btn btn-blue" id="mc-btn" onclick="doManualConnect()">✅ Connect Account</button>
             <span id="mc-msg" style="font-size:12px;color:var(--gray)"></span>
           </div>
         </div>
@@ -869,7 +1122,7 @@ textarea { resize: vertical; line-height: 1.6 }
     <div class="section" style="margin-bottom:24px">
       <div class="section-head">
         <span class="section-title">Search &amp; Add Users</span>
-        <span id="count-pill" class="count-pill ok">0 / 30</span>
+        <span id="count-pill" class="count-pill ok">0 / 100</span>
       </div>
       <div style="padding:18px 18px 0">
         <div class="search-bar">
@@ -896,7 +1149,17 @@ textarea { resize: vertical; line-height: 1.6 }
         <h3>⚙️ Monitor Settings</h3>
         <div class="form-row">
           <label class="form-label">Check Interval (seconds)</label>
-          <input type="number" id="cfg-interval" min="10" max="300" value="45">
+          <select id="cfg-interval" onchange="onIntervalChange(this.value)" style="width:100%">
+            <option value="15">15 seconds — Very fast ⚡ (higher risk)</option>
+            <option value="30" selected>30 seconds — Recommended ✅</option>
+            <option value="45">45 seconds — Safe</option>
+            <option value="60">60 seconds — Very safe</option>
+            <option value="90">90 seconds — Safest</option>
+            <option value="120">120 seconds — Maximum safe</option>
+          </select>
+          <div id="interval-warning" style="display:none;margin-top:8px;padding:10px 12px;background:rgba(255,112,67,.1);border:1px solid rgba(255,112,67,.3);border-radius:8px;font-size:12px;color:#ff7043;line-height:1.6">
+            ⚠️ <b>15 seconds</b> is very aggressive — with many users, Twitter may rate-limit or flag your account. Please use a dedicated monitoring account.
+          </div>
         </div>
         <div class="form-row">
           <label class="form-label">Worker Count</label>
@@ -921,13 +1184,13 @@ textarea { resize: vertical; line-height: 1.6 }
       <div class="settings-card">
         <h3>📊 Capacity</h3>
         <p style="font-size:13px;color:var(--gray-light);line-height:2">
-          Max users &nbsp;<strong style="color:var(--white)">30</strong><br>
+          Max users &nbsp;<strong style="color:var(--white)" id="cap-maxusers">100</strong><br>
           Workers &nbsp;<strong style="color:var(--white)" id="cap-workers">3</strong><br>
           Per worker &nbsp;<strong style="color:var(--white)">10</strong><br>
-          Cycle time &nbsp;<strong style="color:var(--white)">~45 s</strong>
+          Cycle time &nbsp;<strong style="color:var(--white)" id="cap-interval">~30 s</strong>
         </p>
         <p style="font-size:11px;color:var(--gray);margin-top:12px">
-          Added users are picked up on the next monitoring cycle (~45 s).
+          Added users are picked up on the next monitoring cycle.
           Worker / headless changes need an app restart.
         </p>
       </div>
@@ -981,7 +1244,7 @@ async function stopMonitor() {
 // ── Save settings ──────────────────────────────────────────────────────────
 async function saveSettings() {
   const body = {
-    interval: parseInt(document.getElementById('cfg-interval').value) || 45,
+    interval: parseInt(document.getElementById('cfg-interval').value) || 30,
     workers:  parseInt(document.getElementById('cfg-workers').value)  || 3,
     headless: document.getElementById('cfg-headless').checked,
     sound:    document.getElementById('cfg-sound').checked,
@@ -1110,10 +1373,25 @@ async function poll() {
 }
 
 // ── Load settings into form ────────────────────────────────────────────────
+function onIntervalChange(val) {
+  const w = document.getElementById('interval-warning');
+  if (w) w.style.display = parseInt(val) < 30 ? 'block' : 'none';
+  const ci = document.getElementById('cap-interval');
+  if (ci) ci.textContent = '~' + val + ' s';
+}
+
 async function loadSettings() {
   try {
     const s = await (await fetch('/api/settings')).json();
-    document.getElementById('cfg-interval').value   = s.interval;
+    if (s.error) return;
+    // Set dropdown — find closest option, fallback to 30
+    const sel = document.getElementById('cfg-interval');
+    if (sel) {
+      const opts = Array.from(sel.options).map(o => parseInt(o.value));
+      const closest = opts.reduce((a, b) => Math.abs(b - s.interval) < Math.abs(a - s.interval) ? b : a);
+      sel.value = String(closest);
+      onIntervalChange(closest);
+    }
     document.getElementById('cfg-workers').value    = s.workers;
     document.getElementById('cfg-headless').checked = s.headless;
     document.getElementById('cfg-sound').checked    = s.sound;
@@ -1122,6 +1400,7 @@ async function loadSettings() {
 
 // ── Manage Users ───────────────────────────────────────────────────────────
 let _managedUsers = [];
+let _maxUsers     = 100;
 let _st = null;  // debounce timer
 
 function onSearchType() {
@@ -1181,7 +1460,7 @@ function renderSearchResult(data) {
   const name    = data.display_name || data.username;
   const initial = name[0].toUpperCase();
   const already = _managedUsers.some(u => u.username.toLowerCase() === data.username.toLowerCase());
-  const atLimit = _managedUsers.length >= 30;
+  const atLimit = _managedUsers.length >= _maxUsers;
 
   const postHtml = data.latest_post_url
     ? '<a class="det-url" href="' + escAttr(data.latest_post_url) + '" target="_blank" rel="noopener"'
@@ -1191,7 +1470,7 @@ function renderSearchResult(data) {
 
   let action = '';
   if (already)       action = '<span class="already-tag">✓ Already added</span>';
-  else if (atLimit)  action = '<span class="limit-tag">Limit reached (30/30)</span>';
+  else if (atLimit)  action = '<span class="limit-tag">Limit reached (' + _managedUsers.length + '/' + _maxUsers + ')</span>';
   else               action =
     '<button class="btn btn-blue btn-sm" '
     + 'data-uname="'    + escAttr(data.username)                       + '" '
@@ -1279,7 +1558,8 @@ async function loadManagedUsers() {
     _managedUsers = users;
 
     const count   = users.length;
-    const maxU    = data.max_users || 30;
+    const maxU    = data.max_users || 100;
+    _maxUsers     = maxU;
     const pill    = document.getElementById('count-pill');
     if (pill) {
       pill.textContent = count + ' / ' + maxU;
@@ -1293,6 +1573,8 @@ async function loadManagedUsers() {
     }
     const cw = document.getElementById('cap-workers');
     if (cw) cw.textContent = data.worker_count || 3;
+    const cm = document.getElementById('cap-maxusers');
+    if (cm) cm.textContent = maxU;
 
     renderManagedUsers(users);
   } catch {}
@@ -1358,11 +1640,11 @@ function showLoginSuccessModal(handle) {
     + '<div style="font-size:64px;margin-bottom:16px">✅</div>'
     + '<div style="font-size:26px;font-weight:900;color:var(--green);margin-bottom:8px">Connected!</div>'
     + '<div style="font-size:15px;color:var(--gray-light);margin-bottom:20px">'
-    + (handle && handle !== 'Connected Account' ? '<b style="color:var(--white)">' + esc(handle) + '</b> ka Twitter account connect ho gaya.' : 'Twitter account successfully connect ho gaya.')
+    + (handle && handle !== 'Connected Account' ? '<b style="color:var(--white)">' + esc(handle) + '</b> Twitter account connected successfully.' : 'Twitter account connected successfully.')
     + '</div>'
     + '<div style="display:flex;gap:12px;justify-content:center">'
     + '<button class="btn btn-blue" id="modal-go-btn" onclick="document.getElementById(\'login-success-modal\').remove();nav(\'dashboard\')">'
-    + '📊 Dashboard Dekho</button>'
+    + '📊 Go to Dashboard</button>'
     + '</div>'
     + '</div>';
   document.body.appendChild(modal);
@@ -1397,7 +1679,7 @@ async function doQuickLogin() {
   } catch {}
 
   // Fallback: open browser window login
-  if (btn) { btn.disabled = false; btn.textContent = '🔑 Twitter Login Karo'; }
+  if (btn) { btn.disabled = false; btn.textContent = '🔑 Sign in to Twitter'; }
   startLogin();
 }
 
@@ -1419,11 +1701,11 @@ function renderAuthCard(d) {
       '<div style="background:rgba(255,112,67,.08);border:1px solid rgba(255,112,67,.25);border-radius:10px;padding:16px 18px">'
       + '<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">'
       + '<span class="spinner" style="border-top-color:var(--orange);flex-shrink:0"></span>'
-      + '<span style="font-size:14px;font-weight:700;color:var(--white)">Tumhare browser mein login ka wait kar raha hoon…</span>'
+      + '<span style="font-size:14px;font-weight:700;color:var(--white)">Waiting for you to sign in via the browser…</span>'
       + '</div>'
       + '<div style="font-size:13px;color:var(--gray-light);line-height:1.6;margin-bottom:14px">'
-      + '👉 <b style="color:var(--white)">x.com</b> ka tab already khul gaya hoga — wahan <b style="color:var(--green)">Sign in with Google</b> click karo.<br>'
-      + 'Login hote hi yeh page auto update ho jaayega.'
+      + '👉 An <b style="color:var(--white)">x.com</b> tab should have opened — click <b style="color:var(--green)">Sign in with Google</b> there.<br>'
+      + 'This page will update automatically once you sign in.'
       + '</div>'
       + '<button class="btn btn-ghost btn-sm" onclick="cancelLogin()" style="font-size:12px">✕ Cancel</button>'
       + '</div>';
@@ -1475,40 +1757,40 @@ function renderAuthCard(d) {
 
       // Option 1 — Import from browser (PRIMARY, no popup)
       + '<div style="background:rgba(29,155,240,.07);border:1px solid rgba(29,155,240,.2);border-radius:10px;padding:14px 16px">'
-      + '<div style="font-size:13px;font-weight:700;color:var(--white);margin-bottom:4px">⚡ Instant — Edge/Chrome se Import karo</div>'
-      + '<div style="font-size:12px;color:var(--gray-light);margin-bottom:10px">Agar Edge ya Chrome mein x.com pe already login ho — koi popup nahi, koi window nahi, seedha import.</div>'
+      + '<div style="font-size:13px;font-weight:700;color:var(--white);margin-bottom:4px">⚡ Instant — Import from Edge/Chrome</div>'
+      + '<div style="font-size:12px;color:var(--gray-light);margin-bottom:10px">If you are already signed in to x.com in Edge or Chrome — no popup, no extra window, instant import.</div>'
       + '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
-      + '<button class="btn btn-blue btn-sm" id="import-btn" onclick="importBrowserSession()">⬇ Browser se Import Karo</button>'
+      + '<button class="btn btn-blue btn-sm" id="import-btn" onclick="importBrowserSession()">⬇ Import from Browser</button>'
       + '</div>'
       + '<div id="import-msg" style="margin-top:8px;font-size:12px;color:var(--gray)"></div>'
       + '</div>'
 
       // Option 2 — Open browser window (SECONDARY)
       + '<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px">'
-      + '<div style="font-size:13px;font-weight:700;color:var(--gray-light);margin-bottom:4px">🌐 Google se Login karo</div>'
-      + '<div style="font-size:12px;color:var(--gray);margin-bottom:10px">Tumhara apna Edge/Chrome browser khulega — wahan <b style="color:var(--white)">Sign in with Google</b> click karo. Password nahi daalna.</div>'
-      + '<button class="btn btn-ghost btn-sm" id="login-btn" onclick="startLogin()">🔑 Google se Login Karo</button>'
+      + '<div style="font-size:13px;font-weight:700;color:var(--gray-light);margin-bottom:4px">🌐 Sign in with Google</div>'
+      + '<div style="font-size:12px;color:var(--gray);margin-bottom:10px">Your Edge/Chrome browser will open — click <b style="color:var(--white)">Sign in with Google</b> there. No password required.</div>'
+      + '<button class="btn btn-ghost btn-sm" id="login-btn" onclick="startLogin()">🔑 Sign in with Google</button>'
       + '<div id="login-msg" style="margin-top:8px;font-size:12px;color:var(--gray)"></div>'
       + '</div>'
 
       // Option 3 — Manual cookie paste (most reliable, no dependencies)
       + '<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px">'
-      + '<div style="font-size:13px;font-weight:700;color:var(--gray-light);margin-bottom:4px">🍪 Manual Cookie — Sabse Reliable</div>'
-      + '<div style="font-size:12px;color:var(--gray);margin-bottom:8px">Browser DevTools se directly cookies paste karo — koi popup nahi, koi install nahi.</div>'
-      + '<span class="cookie-toggle" onclick="toggleManualForm()">▶ Step-by-step guide dikhao</span>'
+      + '<div style="font-size:13px;font-weight:700;color:var(--gray-light);margin-bottom:4px">🍪 Manual Cookie — Most Reliable</div>'
+      + '<div style="font-size:12px;color:var(--gray);margin-bottom:8px">Paste cookies directly from Browser DevTools — no popup, no installation required.</div>'
+      + '<span class="cookie-toggle" onclick="toggleManualForm()">▶ Show step-by-step guide</span>'
       + '<div id="manual-form" style="display:none;margin-top:12px">'
       + '<div class="cookie-steps">'
-      + '1. Browser mein <b>x.com</b> kholo aur login karo<br>'
-      + '2. <b>F12</b> dabao → <b>Application</b> tab → <b>Cookies</b> → <b>https://x.com</b><br>'
-      + '3. Neeche <b>auth_token</b> dhundho → value copy karo<br>'
-      + '4. Phir <b>ct0</b> dhundho → value copy karo<br>'
-      + '5. Dono yahan paste karo ↓'
+      + '1. Open <b>x.com</b> in your browser and sign in<br>'
+      + '2. Press <b>F12</b> → <b>Application</b> tab → <b>Cookies</b> → <b>https://x.com</b><br>'
+      + '3. Find <b>auth_token</b> → copy its value<br>'
+      + '4. Find <b>ct0</b> → copy its value<br>'
+      + '5. Paste both values below ↓'
       + '</div>'
       + '<div class="cookie-fields">'
-      + '<input type="password" id="manual-auth-token" placeholder="auth_token value yahan paste karo" autocomplete="off" />'
-      + '<input type="text"     id="manual-ct0"        placeholder="ct0 value yahan paste karo"        autocomplete="off" />'
+      + '<input type="password" id="manual-auth-token" placeholder="Paste auth_token value here" autocomplete="off" />'
+      + '<input type="text"     id="manual-ct0"        placeholder="Paste ct0 value here"        autocomplete="off" />'
       + '</div>'
-      + '<button class="btn btn-blue btn-sm" id="manual-btn" onclick="manualLogin()">✅ Connect Karo</button>'
+      + '<button class="btn btn-blue btn-sm" id="manual-btn" onclick="manualLogin()">✅ Connect Account</button>'
       + '<div id="manual-msg" style="margin-top:8px;font-size:12px;color:var(--gray)"></div>'
       + '</div>'
       + '</div>'
@@ -1521,7 +1803,7 @@ async function importBrowserSession() {
   const btn = document.getElementById('import-btn');
   const msg = document.getElementById('import-msg');
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Connecting…'; }
-  if (msg) { msg.style.color = 'var(--gray)'; msg.textContent = 'Edge browser se cookies import ho rahi hain…'; }
+  if (msg) { msg.style.color = 'var(--gray)'; msg.textContent = 'Importing cookies from Edge browser…'; }
   try {
     const res = await fetch('/api/auth/import-browser', {method:'POST'});
     const d   = await res.json();
@@ -1532,14 +1814,14 @@ async function importBrowserSession() {
     } else {
       const reason = d.reason || 'Failed';
       // Show helpful hint if Edge login missing
-      const hint = reason.toLowerCase().includes('nahi mila') || reason.toLowerCase().includes('not found')
-        ? ' — pehle Edge browser mein x.com pe login karein'
+      const hint = reason.toLowerCase().includes('no twitter login') || reason.toLowerCase().includes('not found')
+        ? ' — please sign in to x.com in Edge browser first'
         : '';
       if (msg) { msg.style.color = 'var(--red)'; msg.textContent = '❌ ' + reason + hint; }
       if (btn) { btn.disabled = false; btn.innerHTML = '2. Connect ✓'; }
     }
   } catch {
-    if (msg) { msg.style.color = 'var(--red)'; msg.textContent = '❌ Network error — app chal raha hai?'; }
+    if (msg) { msg.style.color = 'var(--red)'; msg.textContent = '❌ Network error — is the app running?'; }
     if (btn) { btn.disabled = false; btn.innerHTML = '2. Connect ✓'; }
   }
 }
@@ -1547,8 +1829,8 @@ async function importBrowserSession() {
 async function startLogin() {
   const btn = document.getElementById('login-btn');
   const msg = document.getElementById('login-msg');
-  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Browser khul raha hai…'; }
-  if (msg) { msg.style.color = 'var(--gray)'; msg.textContent = 'Apne browser mein Twitter login karo (Google se bhi ho sakta hai) — yeh page auto update ho jaayega'; }
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Opening browser…'; }
+  if (msg) { msg.style.color = 'var(--gray)'; msg.textContent = 'Sign in to Twitter in your browser (Google login works too) — this page will update automatically'; }
   try {
     const res = await fetch('/api/auth/login', {method:'POST'});
     const d   = await res.json();
@@ -1556,12 +1838,12 @@ async function startLogin() {
       _loginWasPending = true;
       loadAuthStatus();
     } else {
-      if (msg) { msg.style.color = 'var(--red)'; msg.textContent = '❌ ' + (d.message || 'Start nahi hua'); }
-      if (btn) { btn.disabled = false; btn.innerHTML = 'Browser Window Kholo'; }
+      if (msg) { msg.style.color = 'var(--red)'; msg.textContent = '❌ ' + (d.message || 'Could not start'); }
+      if (btn) { btn.disabled = false; btn.innerHTML = 'Open Browser Window'; }
     }
   } catch {
     if (msg) { msg.style.color = 'var(--red)'; msg.textContent = '❌ Network error'; }
-    if (btn) { btn.disabled = false; btn.innerHTML = 'Browser Window Kholo'; }
+    if (btn) { btn.disabled = false; btn.innerHTML = 'Open Browser Window'; }
   }
 }
 
@@ -1575,7 +1857,7 @@ function toggleManualForm() {
   if (!form) return;
   const open = form.style.display === 'none';
   form.style.display = open ? 'block' : 'none';
-  if (toggle) toggle.textContent = open ? '▼ Guide band karo' : '▶ Step-by-step guide dikhao';
+  if (toggle) toggle.textContent = open ? '▼ Close guide' : '▶ Show step-by-step guide';
 }
 
 async function manualLogin() {
@@ -1585,11 +1867,11 @@ async function manualLogin() {
   const msg       = document.getElementById('manual-msg');
 
   if (!authToken || !ct0) {
-    if (msg) { msg.style.color = 'var(--red)'; msg.textContent = '❌ Dono fields fill karo'; }
+    if (msg) { msg.style.color = 'var(--red)'; msg.textContent = '❌ Please fill in both fields'; }
     return;
   }
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Connecting…'; }
-  if (msg) { msg.style.color = 'var(--gray)'; msg.textContent = 'Cookies verify ho rahi hain…'; }
+  if (msg) { msg.style.color = 'var(--gray)'; msg.textContent = 'Verifying cookies…'; }
 
   try {
     const res = await fetch('/api/auth/manual', {
@@ -1604,11 +1886,11 @@ async function manualLogin() {
       loadAuthStatus();
     } else {
       if (msg) { msg.style.color = 'var(--red)'; msg.textContent = '❌ ' + (d.reason || 'Failed'); }
-      if (btn) { btn.disabled = false; btn.textContent = '✅ Connect Karo'; }
+      if (btn) { btn.disabled = false; btn.textContent = '✅ Connect Account'; }
     }
   } catch {
     if (msg) { msg.style.color = 'var(--red)'; msg.textContent = '❌ Network error'; }
-    if (btn) { btn.disabled = false; btn.textContent = '✅ Connect Karo'; }
+    if (btn) { btn.disabled = false; btn.textContent = '✅ Connect Account'; }
   }
 }
 
@@ -1621,7 +1903,7 @@ async function cancelLogin() {
 }
 
 async function disconnectTwitter() {
-  if (!confirm('Twitter account disconnect karein? Monitoring bina login ke chalti rahegi.')) return;
+  if (!confirm('Disconnect your Twitter account? Monitoring will continue without login.')) return;
   _loginWasPending = false;
   await fetch('/api/auth/logout', {method:'POST'});
   loadAuthStatus();
@@ -1654,9 +1936,9 @@ async function doManualConnect() {
   const ct0       = (document.getElementById('mc-ct0')?.value  || '').trim();
   const btn = document.getElementById('mc-btn');
   const msg = document.getElementById('mc-msg');
-  if (!authToken || !ct0) { if(msg){msg.style.color='var(--red)';msg.textContent='❌ Dono fields fill karo';} return; }
+  if (!authToken || !ct0) { if(msg){msg.style.color='var(--red)';msg.textContent='❌ Please fill in both fields';} return; }
   if (btn) { btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Connecting…'; }
-  if (msg) { msg.style.color='var(--gray)'; msg.textContent='Verify ho raha hai…'; }
+  if (msg) { msg.style.color='var(--gray)'; msg.textContent='Verifying…'; }
   try {
     const res = await fetch('/api/auth/manual', {
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -1670,25 +1952,120 @@ async function doManualConnect() {
       refreshAuthBadge();
     } else {
       if (msg){msg.style.color='var(--red)'; msg.textContent='❌ '+(d.reason||'Failed');}
-      if (btn){btn.disabled=false; btn.textContent='✅ Connect Karo';}
+      if (btn){btn.disabled=false; btn.textContent='✅ Connect Account';}
     }
   } catch {
     if (msg){msg.style.color='var(--red)'; msg.textContent='❌ Network error';}
-    if (btn){btn.disabled=false; btn.textContent='✅ Connect Karo';}
+    if (btn){btn.disabled=false; btn.textContent='✅ Connect Account';}
   }
 }
 
 async function doLogout() {
-  if (!confirm('Twitter disconnect karein?')) return;
+  if (!confirm('Disconnect your Twitter account?')) return;
   await fetch('/api/auth/logout', {method:'POST'});
   refreshAuthBadge();
 }
 
+// ── App-level logout & user chip ──────────────────────────────────────────
+async function appLogout() {
+  if (!confirm('Are you sure you want to log out?')) return;
+  await fetch('/app/logout', {method:'POST'});
+  window.location.href = '/';
+}
+
+async function loadAppUser() {
+  try {
+    const d = await fetch('/api/me');
+    if (d.status === 401) { window.location.href = '/'; return; }
+    const u = await d.json();
+    const chip = document.getElementById('app-user-chip');
+    if (chip) chip.textContent = u.name || u.username || '—';
+  } catch {}
+}
+
+// ── Welcome / Onboarding Modal ────────────────────────────────────────────
+function showWelcomeModal() {
+  if (document.getElementById('welcome-modal')) return;
+  const modal = document.createElement('div');
+  modal.id = 'welcome-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;animation:fadein .3s ease';
+  modal.innerHTML = `
+<div style="background:#16181c;border:1px solid #2f3336;border-radius:20px;max-width:560px;width:100%;box-shadow:0 24px 80px rgba(0,0,0,.7);overflow:hidden">
+  <div style="background:linear-gradient(135deg,rgba(29,155,240,.15),rgba(29,155,240,.05));border-bottom:1px solid #2f3336;padding:28px 32px 20px">
+    <div style="font-size:32px;margin-bottom:8px">👋</div>
+    <div style="font-size:22px;font-weight:900;color:#e7e9ea;margin-bottom:4px">Welcome to X Monitor</div>
+    <div style="font-size:14px;color:#71767b">Here's a quick guide to get you started.</div>
+  </div>
+  <div style="padding:24px 32px;display:flex;flex-direction:column;gap:18px">
+
+    <div style="display:flex;gap:14px;align-items:flex-start">
+      <div style="background:rgba(29,155,240,.15);border-radius:50%;width:36px;height:36px;display:grid;place-items:center;flex-shrink:0;font-size:16px">1</div>
+      <div>
+        <div style="font-size:14px;font-weight:700;color:#e7e9ea;margin-bottom:3px">Connect your Twitter account</div>
+        <div style="font-size:13px;color:#71767b;line-height:1.5">Go to <b style="color:#e7e9ea">Settings → Twitter Account</b>. The fastest way is <b style="color:#e7e9ea">Import from Browser</b> — it reads your existing Edge/Chrome session with one click. No password needed.</div>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:14px;align-items:flex-start">
+      <div style="background:rgba(29,155,240,.15);border-radius:50%;width:36px;height:36px;display:grid;place-items:center;flex-shrink:0;font-size:16px">2</div>
+      <div>
+        <div style="font-size:14px;font-weight:700;color:#e7e9ea;margin-bottom:3px">Add accounts to monitor</div>
+        <div style="font-size:13px;color:#71767b;line-height:1.5">Go to <b style="color:#e7e9ea">Manage Users</b>, type a Twitter username or display name in the search box, and click <b style="color:#e7e9ea">Add</b>. You can monitor up to <b style="color:#e7e9ea">100 accounts</b>.</div>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:14px;align-items:flex-start">
+      <div style="background:rgba(0,186,124,.12);border-radius:50%;width:36px;height:36px;display:grid;place-items:center;flex-shrink:0;font-size:16px">⏱</div>
+      <div>
+        <div style="font-size:14px;font-weight:700;color:#e7e9ea;margin-bottom:3px">Check interval — 30 seconds recommended</div>
+        <div style="font-size:13px;color:#71767b;line-height:1.5">In <b style="color:#e7e9ea">Settings</b>, set how often all accounts are checked. <b style="color:#e7e9ea">30 seconds</b> is the sweet spot — fast enough to catch new tweets, safe enough to avoid rate limits for up to 30 users.</div>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:14px;align-items:flex-start">
+      <div style="background:rgba(244,33,46,.1);border-radius:50%;width:36px;height:36px;display:grid;place-items:center;flex-shrink:0;font-size:16px">⚙️</div>
+      <div>
+        <div style="font-size:14px;font-weight:700;color:#e7e9ea;margin-bottom:3px">Workers — browser page pool size</div>
+        <div style="font-size:13px;color:#71767b;line-height:1.5">Workers control how many browser pages run in parallel. More workers = faster cycles but more RAM. <b style="color:#e7e9ea">5 workers</b> is the default and works well for most setups.</div>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:14px;align-items:flex-start">
+      <div style="background:rgba(255,112,67,.1);border-radius:50%;width:36px;height:36px;display:grid;place-items:center;flex-shrink:0;font-size:16px">💡</div>
+      <div>
+        <div style="font-size:14px;font-weight:700;color:#e7e9ea;margin-bottom:3px">Use a dedicated monitoring account</div>
+        <div style="font-size:13px;color:#71767b;line-height:1.5">For best results, connect a <b style="color:#e7e9ea">separate Twitter account</b> used only for monitoring — not your main account. This reduces the risk of your primary account being rate-limited.</div>
+      </div>
+    </div>
+
+  </div>
+  <div style="padding:16px 32px 24px;display:flex;justify-content:flex-end;gap:10px;border-top:1px solid #2f3336">
+    <button class="btn btn-ghost btn-sm" onclick="dismissWelcomeModal(true)">Don't show again</button>
+    <button class="btn btn-blue" onclick="dismissWelcomeModal(false)">Got it, let's start! →</button>
+  </div>
+</div>`;
+  document.body.appendChild(modal);
+}
+
+function dismissWelcomeModal(permanent) {
+  const m = document.getElementById('welcome-modal');
+  if (m) m.remove();
+  if (permanent) localStorage.setItem('xmon_welcome_seen', '1');
+}
+
+function maybeShowWelcome() {
+  if (!localStorage.getItem('xmon_welcome_seen')) {
+    setTimeout(showWelcomeModal, 600);
+  }
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────
+loadAppUser();
 poll();
 loadSettings();
 loadManagedUsers();
 refreshAuthBadge();
+maybeShowWelcome();
 setInterval(poll, 3000);
 </script>
 </body>

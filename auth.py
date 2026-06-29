@@ -28,6 +28,99 @@ SESSION_META_PATH = SESSION_PATH + ".meta"
 _session_reload_flag = False
 _reload_lock = threading.Lock()
 
+# Per-user reload flags: {user_id: bool}
+_user_reload_flags: dict[int, bool] = {}
+_user_reload_lock = threading.Lock()
+
+
+def get_user_session_path(user_id: int) -> str:
+    return os.path.join(_BASE_DIR, "data", "sessions", f"user_{user_id}", "twitter_session.json")
+
+
+def get_user_meta_path(user_id: int) -> str:
+    return get_user_session_path(user_id) + ".meta"
+
+
+def session_exists_for(user_id: int) -> bool:
+    path = get_user_session_path(user_id)
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return any(c.get("name") == "auth_token" for c in data.get("cookies", []))
+    except Exception:
+        return False
+
+
+def get_session_username_for(user_id: int) -> Optional[str]:
+    meta = get_user_meta_path(user_id)
+    if os.path.exists(meta):
+        try:
+            with open(meta, encoding="utf-8") as f:
+                saved = json.load(f).get("username", "")
+            if saved and saved not in ("unknown", "imported"):
+                return saved
+        except Exception:
+            pass
+    return None
+
+
+def clear_session_for(user_id: int) -> None:
+    for path in (get_user_session_path(user_id), get_user_meta_path(user_id)):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+    logger.info("Twitter session cleared for user %d", user_id)
+
+
+def check_user_session_reload(user_id: int) -> bool:
+    with _user_reload_lock:
+        return _user_reload_flags.get(user_id, False)
+
+
+def consume_user_session_reload(user_id: int) -> bool:
+    with _user_reload_lock:
+        if _user_reload_flags.get(user_id, False):
+            _user_reload_flags[user_id] = False
+            return True
+        return False
+
+
+def save_manual_cookies_for(auth_token: str, ct0: str, user_id: int) -> tuple[bool, str]:
+    auth_token = auth_token.strip()
+    ct0        = ct0.strip()
+    if not auth_token or not ct0:
+        return False, "auth_token aur ct0 dono required hain"
+
+    cookies_list = [
+        {"name": "auth_token", "value": auth_token, "domain": ".x.com",
+         "path": "/", "secure": True, "httpOnly": True, "sameSite": "None", "expires": -1},
+        {"name": "auth_token", "value": auth_token, "domain": ".twitter.com",
+         "path": "/", "secure": True, "httpOnly": True, "sameSite": "None", "expires": -1},
+        {"name": "ct0", "value": ct0, "domain": ".x.com",
+         "path": "/", "secure": True, "httpOnly": False, "sameSite": "Lax", "expires": -1},
+        {"name": "ct0", "value": ct0, "domain": ".twitter.com",
+         "path": "/", "secure": True, "httpOnly": False, "sameSite": "Lax", "expires": -1},
+    ]
+
+    path = get_user_session_path(user_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"cookies": cookies_list, "origins": []}, f)
+
+    username = _extract_username_from_cookies(cookies_list)
+    with open(get_user_meta_path(user_id), "w", encoding="utf-8") as f:
+        json.dump({"username": username or "unknown"}, f)
+
+    with _user_reload_lock:
+        _user_reload_flags[user_id] = True
+
+    logger.info("Manual cookies saved for user %d — twitter: %s", user_id, username)
+    return True, username or "unknown"
+
 
 def check_session_reload() -> bool:
     """Return True if a new session was just saved (does NOT consume the flag)."""
@@ -329,13 +422,13 @@ def import_from_browser() -> tuple[bool, str]:
                 capture_output=True, text=True, timeout=120,
             )
             if result.returncode != 0:
-                return False, f"Install fail hua: {result.stderr.strip()[-200:]}"
+                return False, f"Install failed: {result.stderr.strip()[-200:]}"
         except Exception as exc:
-            return False, f"Install nahi ho saka: {exc}"
+            return False, f"Could not install: {exc}"
         try:
             import browser_cookie3  # type: ignore  # noqa: F811
         except ImportError:
-            return False, "Install ke baad bhi import nahi hua — app restart karein"
+            return False, "Import still failing after install — please restart the app"
 
     cookies_list: list[dict] = []
     imported_from = ""
@@ -377,8 +470,8 @@ def import_from_browser() -> tuple[bool, str]:
 
     if not cookies_list or not any(c["name"] == "auth_token" for c in cookies_list):
         return False, (
-            "Twitter login nahi mila. "
-            "Edge browser mein x.com pe login karein, phir dobara try karein."
+            "No Twitter login found in Edge/Chrome. "
+            "Please sign in to x.com in your browser first, then try again."
         )
 
     os.makedirs(os.path.dirname(SESSION_PATH), exist_ok=True)
@@ -504,8 +597,8 @@ async def _do_login_async() -> dict:
             from winotify import Notification
             n = Notification(
                 app_id="X Monitor",
-                title="Twitter Login — Browser Window Khula",
-                msg="Nayi browser window mein Twitter login karein. Gmail (Google) se bhi login kar sakte hain.",
+                title="Twitter Login — Browser Window Opened",
+                msg="Sign in to Twitter in the browser window that just opened. Google login also works.",
                 duration="long",
             )
             n.show()
@@ -651,8 +744,8 @@ def start_login() -> tuple[bool, str]:
             except Exception:
                 pass
         _set_state(in_progress=False, done=True,
-                   result={"ok": False, "reason": "Timeout — 5 minute mein login nahi hua"})
+                   result={"ok": False, "reason": "Timeout — login was not completed within 5 minutes"})
 
     t = threading.Thread(target=_poll, daemon=True, name="twitter-login")
     t.start()
-    return True, "Browser mein x.com/login khul gaya — Google se login karo"
+    return True, "x.com/login has been opened in your browser — sign in with Google"

@@ -152,7 +152,7 @@ class ProfileMonitor:
         if "login" in current_url and username.lower() not in current_url.lower():
             logger.warning(
                 "@%s — Twitter login wall detected. "
-                "Settings mein Twitter account connect karein.",
+                "Please connect a Twitter account in Settings.",
                 username,
             )
             return None
