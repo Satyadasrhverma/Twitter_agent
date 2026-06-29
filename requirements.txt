@@ -1,0 +1,14 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+pydantic==2.9.2
+playwright==1.60.0
+aiosqlite==0.22.1
+winotify==1.1.0
+tenacity==8.5.0
+rich==15.0.0
+customtkinter==6.0.0
+pystray==0.19.5
+Pillow==11.2.1
+browser-cookie3==0.19.1
+playwright-stealth==1.0.0
+pycryptodome==3.21.0

@@ -1,0 +1,24 @@
+# Sensitive data — never commit
+data/twitter_session.json
+data/twitter_session.json.meta
+data/users_list.json
+data/monitor.db
+data/monitor.db-shm
+data/monitor.db-wal
+data/test_scheduler.db
+data/test_scheduler.db-shm
+data/test_scheduler.db-wal
+data/login_profile/
+
+# Logs
+logs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Env
+.env
+*.env
