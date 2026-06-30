@@ -66,7 +66,9 @@ class ToastNotifier:
         )
 
         if config.NOTIFICATION_SOUND:
-            toast.set_audio(audio.Default, loop=False)
+            # A distinct sound (not the generic Windows default) so this
+            # notification is instantly recognizable as an X Monitor alert.
+            toast.set_audio(audio.Reminder, loop=False)
         else:
             toast.set_audio(audio.Silent, loop=False)
 
