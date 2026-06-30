@@ -23,6 +23,7 @@ from pydantic import BaseModel
 import app_auth
 import auth
 import config
+import whatsapp
 from ui_state import AppState
 
 app_auth.init_tables()   # ensure app_users table exists
@@ -306,7 +307,7 @@ async def search_user_endpoint(body: UsernameIn, user: Optional[dict] = Depends(
             return JSONResponse({"found": False, "reason": "Empty username"})
 
         has_space = " " in query
-        if auth.session_exists_for(uid) and monitor is not None and has_space:
+        if auth.session_exists() and monitor is not None and has_space:
             try:
                 results = await asyncio.to_thread(monitor.search_users_by_name, query)
                 if results:
@@ -393,7 +394,9 @@ async def remove_user_endpoint(username: str, user: Optional[dict] = Depends(_cu
     return JSONResponse({"ok": removed, "user_count": len(s.get_monitored_users())})
 
 
-# ── Twitter auth endpoints (per-user) ────────────────────────────────────────
+# ── Twitter auth endpoints (app-level, shared — admin only) ──────────────────
+# Twitter login is connected ONCE by the admin and reused by every app-user's
+# monitoring. Other users never need to share their own Twitter credentials.
 
 @app.get("/api/auth/status")
 async def auth_status(user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
@@ -402,11 +405,12 @@ async def auth_status(user: Optional[dict] = Depends(_current_user)) -> JSONResp
     uid      = user["user_id"]
     login_st = auth.get_login_state()
     return JSONResponse({
-        "logged_in":         auth.session_exists_for(uid),
-        "username":          auth.get_session_username_for(uid),
+        "logged_in":         auth.session_exists(),
+        "username":          auth.get_session_username(),
         "login_in_progress": login_st["in_progress"],
         "login_done":        login_st["done"],
         "login_result":      login_st["result"],
+        "is_admin":          app_auth.is_admin(uid),
     })
 
 
@@ -414,6 +418,8 @@ async def auth_status(user: Optional[dict] = Depends(_current_user)) -> JSONResp
 async def auth_login(user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
     if not user:
         return JSONResponse({"error": "not authenticated"}, status_code=401)
+    if not app_auth.is_admin(user["user_id"]):
+        return JSONResponse({"started": False, "message": "Only the app admin can connect Twitter."})
     started, msg = auth.start_login()
     return JSONResponse({"started": started, "message": msg})
 
@@ -422,7 +428,9 @@ async def auth_login(user: Optional[dict] = Depends(_current_user)) -> JSONRespo
 async def auth_logout(user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
     if not user:
         return JSONResponse({"error": "not authenticated"}, status_code=401)
-    auth.clear_session_for(user["user_id"])
+    if not app_auth.is_admin(user["user_id"]):
+        return JSONResponse({"ok": False, "reason": "Only the app admin can disconnect Twitter."})
+    auth.clear_session()
     return JSONResponse({"ok": True})
 
 
@@ -441,22 +449,45 @@ class ManualCookieIn(BaseModel):
 async def auth_manual(body: ManualCookieIn, user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
     if not user:
         return JSONResponse({"error": "not authenticated"}, status_code=401)
-    uid = user["user_id"]
-    ok, result = await asyncio.to_thread(auth.save_manual_cookies_for, body.auth_token, body.ct0, uid)
-    if ok:
-        # Reload the monitor so it picks up the new session
-        if _user_manager:
-            _user_manager.ensure_running(uid)
-        return JSONResponse({"ok": True, "username": result})
-    return JSONResponse({"ok": False, "reason": result})
+    if not app_auth.is_admin(user["user_id"]):
+        return JSONResponse({"ok": False, "reason": "Only the app admin can connect Twitter."})
+    ok, result = await asyncio.to_thread(auth.save_manual_cookies, body.auth_token, body.ct0)
+    return JSONResponse({"ok": ok, "username": result} if ok else {"ok": False, "reason": result})
 
 
 @app.post("/api/auth/import-browser")
 async def auth_import_browser(user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
     if not user:
         return JSONResponse({"error": "not authenticated"}, status_code=401)
+    if not app_auth.is_admin(user["user_id"]):
+        return JSONResponse({"ok": False, "reason": "Only the app admin can connect Twitter."})
     ok, reason = await asyncio.to_thread(auth.import_from_browser)
     return JSONResponse({"ok": ok, "reason": reason})
+
+
+# ── WhatsApp notification number (per-user) ──────────────────────────────────
+
+class WhatsAppIn(BaseModel):
+    number: str
+
+
+@app.get("/api/whatsapp")
+async def whatsapp_get(user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    number = await asyncio.to_thread(app_auth.get_whatsapp_number, user["user_id"])
+    return JSONResponse({"number": number, "configured": whatsapp.is_configured()})
+
+
+@app.post("/api/whatsapp")
+async def whatsapp_set(body: WhatsAppIn, user: Optional[dict] = Depends(_current_user)) -> JSONResponse:
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    number = body.number.strip()
+    if number and not _re.match(r"^\+?[0-9]{8,15}$", number):
+        return JSONResponse({"ok": False, "reason": "Enter a valid phone number with country code (e.g. +919876543210)"})
+    await asyncio.to_thread(app_auth.set_whatsapp_number, user["user_id"], number)
+    return JSONResponse({"ok": True})
 
 
 class ControlIn(BaseModel):
@@ -1182,6 +1213,22 @@ textarea { resize: vertical; line-height: 1.6 }
       </div>
 
       <div class="settings-card">
+        <h3>📱 WhatsApp Alerts</h3>
+        <p style="font-size:12px;color:var(--gray-light);line-height:1.6;margin-bottom:10px">
+          Get a WhatsApp message the moment one of your monitored accounts posts something new.
+        </p>
+        <div class="form-row">
+          <label class="form-label">Your WhatsApp Number</label>
+          <input type="text" id="cfg-whatsapp" placeholder="+919876543210" style="width:100%">
+        </div>
+        <div class="settings-save-row">
+          <button class="btn btn-blue btn-sm" onclick="saveWhatsApp()">💾 Save Number</button>
+          <span class="save-msg" id="whatsapp-save-msg">✓ Saved!</span>
+        </div>
+        <div id="whatsapp-status" style="margin-top:10px;font-size:12px;color:var(--gray);line-height:1.6"></div>
+      </div>
+
+      <div class="settings-card">
         <h3>📊 Capacity</h3>
         <p style="font-size:13px;color:var(--gray-light);line-height:2">
           Max users &nbsp;<strong style="color:var(--white)" id="cap-maxusers">100</strong><br>
@@ -1231,7 +1278,7 @@ function nav(page) {
   document.getElementById('page-title').textContent = titles[page] || page;
   currentPage = page;
 
-  if (page === 'settings') { loadManagedUsers(); refreshAuthBadge(); }
+  if (page === 'settings') { loadManagedUsers(); refreshAuthBadge(); loadWhatsApp(); }
 }
 
 // ── Stop monitoring ────────────────────────────────────────────────────────
@@ -1254,6 +1301,34 @@ async function saveSettings() {
   const msg = document.getElementById('save-msg');
   msg.classList.add('show');
   setTimeout(() => msg.classList.remove('show'), 2500);
+}
+
+// ── WhatsApp number ──────────────────────────────────────────────────────────
+async function loadWhatsApp() {
+  try {
+    const d = await (await fetch('/api/whatsapp')).json();
+    const input  = document.getElementById('cfg-whatsapp');
+    const status = document.getElementById('whatsapp-status');
+    if (input) input.value = d.number || '';
+    if (status) {
+      status.textContent = d.configured
+        ? ''
+        : '⚠️ WhatsApp sending is not set up by the admin yet — your number will be saved but alerts won\'t go out until it is.';
+    }
+  } catch {}
+}
+
+async function saveWhatsApp() {
+  const number = (document.getElementById('cfg-whatsapp')?.value || '').trim();
+  try {
+    const res = await fetch('/api/whatsapp', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({number}) });
+    const d = await res.json();
+    if (!d.ok) { alert(d.reason || 'Could not save number'); return; }
+    const msg = document.getElementById('whatsapp-save-msg');
+    msg.classList.add('show');
+    setTimeout(() => msg.classList.remove('show'), 2500);
+  } catch {}
 }
 
 // ── Toast ──────────────────────────────────────────────────────────────────
@@ -1684,13 +1759,35 @@ async function doQuickLogin() {
 }
 
 function renderAuthCard(d) {
-  // Show/hide dashboard login banner
+  // Show/hide dashboard login banner — only the admin can act on it
   const banner = document.getElementById('login-banner');
-  if (banner) banner.style.display = d.logged_in ? 'none' : 'flex';
+  if (banner) banner.style.display = (d.logged_in || !d.is_admin) ? 'none' : 'flex';
 
   const badge = document.getElementById('auth-status-badge');
   const body  = document.getElementById('auth-body');
   if (!badge || !body) return;
+
+  // Non-admin users never manage Twitter directly — it's shared app-wide
+  if (!d.is_admin) {
+    if (d.logged_in) {
+      badge.textContent = '✓ Active';
+      badge.style.background = 'rgba(0,186,124,.15)';
+      badge.style.color = 'var(--green)';
+      body.innerHTML =
+        '<div style="background:rgba(0,186,124,.08);border:1px solid rgba(0,186,124,.25);border-radius:10px;padding:14px 16px;font-size:13px;color:var(--gray-light);line-height:1.6">'
+        + '✓ Twitter access is managed by the app admin. You can add accounts to monitor right away below — no Twitter login needed from you.'
+        + '</div>';
+    } else {
+      badge.textContent = 'Setting up…';
+      badge.style.background = 'rgba(113,118,123,.12)';
+      badge.style.color = 'var(--gray)';
+      body.innerHTML =
+        '<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px;font-size:13px;color:var(--gray-light);line-height:1.6">'
+        + 'Twitter access is managed by the app admin and is being set up. You can still add accounts to monitor below — checks will start automatically once it\'s ready.'
+        + '</div>';
+    }
+    return;
+  }
 
   if (d.login_in_progress) {
     _loginWasPending = true;
