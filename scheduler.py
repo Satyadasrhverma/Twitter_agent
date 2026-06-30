@@ -11,7 +11,9 @@ import socket
 from datetime import datetime, timezone
 from typing import List, Optional
 
+import app_auth
 import config
+import whatsapp
 from browser import BrowserPool
 from database import Database
 from models import MonitorResult, UserRecord
@@ -280,6 +282,7 @@ class Scheduler:
                         display_name=result.post.display_name,
                         post_url=result.post.post_url,
                     ))
+                await self._send_whatsapp(result)
             else:
                 logger.info("First seen @%s — seeding post_id=%s (no notification)", username, new_post_id)
 
@@ -300,3 +303,21 @@ class Scheduler:
         if self._state:
             self._state.update_user(username, now, last_post_id=new_post_id, ok=True)  # type: ignore[union-attr]
             self._state.sync_from_scheduler(self)                                        # type: ignore[union-attr]
+
+    async def _send_whatsapp(self, result: MonitorResult) -> None:
+        """Best-effort WhatsApp alert to this app-user's saved number. Never raises."""
+        if not self._state or not whatsapp.is_configured():
+            return
+        user_id = getattr(self._state, "user_id", 0)
+        if not user_id:
+            return
+        try:
+            number = await asyncio.to_thread(app_auth.get_whatsapp_number, user_id)
+            if not number:
+                return
+            assert result.post is not None
+            name = result.post.display_name or f"@{result.post.username}"
+            msg = f"X Monitor Alert\n{name} posted something new:\n{result.post.post_url}"
+            await asyncio.to_thread(whatsapp.send_whatsapp, number, msg)
+        except Exception as exc:
+            logger.warning("WhatsApp notify failed for user %d: %s", user_id, exc)

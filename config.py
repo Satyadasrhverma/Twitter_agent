@@ -21,6 +21,21 @@ GOOGLE_CLIENT_ID: Final[str] = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET: Final[str] = os.getenv("GOOGLE_CLIENT_SECRET", "")
 
 # ---------------------------------------------------------------------------
+# App admin (only this account can connect/disconnect the shared Twitter
+# session). Falls back to the first-ever registered app user if unset.
+# ---------------------------------------------------------------------------
+
+ADMIN_EMAIL: Final[str] = os.getenv("ADMIN_EMAIL", "")
+
+# ---------------------------------------------------------------------------
+# Twilio WhatsApp notifications (optional)
+# ---------------------------------------------------------------------------
+
+TWILIO_ACCOUNT_SID: Final[str] = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN: Final[str] = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_WHATSAPP_FROM: Final[str] = os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
+
+# ---------------------------------------------------------------------------
 # Monitoring targets
 # ---------------------------------------------------------------------------
 

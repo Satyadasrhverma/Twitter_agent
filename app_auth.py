@@ -48,9 +48,10 @@ def init_tables() -> None:
             )
         """)
         # Migration: add columns to older schema if needed
-        _add_col(c, 'app_users', 'google_id', 'TEXT')
-        _add_col(c, 'app_users', 'email',     'TEXT NOT NULL DEFAULT ""')
-        _add_col(c, 'app_users', 'name',      'TEXT NOT NULL DEFAULT ""')
+        _add_col(c, 'app_users', 'google_id',       'TEXT')
+        _add_col(c, 'app_users', 'email',            'TEXT NOT NULL DEFAULT ""')
+        _add_col(c, 'app_users', 'name',             'TEXT NOT NULL DEFAULT ""')
+        _add_col(c, 'app_users', 'whatsapp_number',  'TEXT NOT NULL DEFAULT ""')
         c.commit()
 
 
@@ -111,3 +112,31 @@ def get_all_users() -> list[dict]:
             "SELECT id, google_id, email, name, created_at FROM app_users ORDER BY id"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def is_admin(user_id: int) -> bool:
+    """
+    Only the admin can connect/disconnect the shared Twitter session.
+    Matched by ADMIN_EMAIL (.env) if set, else the first-ever registered user.
+    """
+    if config.ADMIN_EMAIL:
+        with _conn() as c:
+            row = c.execute("SELECT email FROM app_users WHERE id=?", (user_id,)).fetchone()
+        if not row:
+            return False
+        return row["email"].strip().lower() == config.ADMIN_EMAIL.strip().lower()
+    return user_id == 1
+
+
+# ── WhatsApp notification number ─────────────────────────────────────────────
+
+def set_whatsapp_number(user_id: int, number: str) -> None:
+    with _conn() as c:
+        c.execute("UPDATE app_users SET whatsapp_number=? WHERE id=?", (number.strip(), user_id))
+        c.commit()
+
+
+def get_whatsapp_number(user_id: int) -> str:
+    with _conn() as c:
+        row = c.execute("SELECT whatsapp_number FROM app_users WHERE id=?", (user_id,)).fetchone()
+    return row["whatsapp_number"] if row else ""
