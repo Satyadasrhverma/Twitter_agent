@@ -101,13 +101,13 @@ class MonitorThread(threading.Thread):
         db = Database(owner_id=self._user_id)
         await db.connect()
 
+        # Twitter login is app-level and shared by every app-user — track our
+        # own baseline version so we reload independently of other users'
+        # MonitorThreads (avoids a consume-race on a single shared flag).
+        last_version = auth.get_session_version()
+
         while True:
-            # Determine which session file to use for this user
-            if self._user_id > 0:
-                s_path = auth.get_user_session_path(self._user_id)
-                session = s_path if auth.session_exists_for(self._user_id) else None
-            else:
-                session = auth.SESSION_PATH if auth.session_exists() else None
+            session = auth.SESSION_PATH if auth.session_exists() else None
 
             users = self._state.get_monitored_users()
             async with BrowserPool(pool_size=config.WORKER_COUNT, session_path=session) as pool:
@@ -121,7 +121,7 @@ class MonitorThread(threading.Thread):
                 )
                 sched_task = asyncio.create_task(self._scheduler.run(), name="scheduler")
                 watch_task = asyncio.create_task(
-                    self._watch_for_session_reload(self._scheduler), name="session-watcher"
+                    self._watch_for_session_reload(self._scheduler, last_version), name="session-watcher"
                 )
                 done, pending = await asyncio.wait(
                     [sched_task, watch_task],
@@ -133,28 +133,20 @@ class MonitorThread(threading.Thread):
 
             self._pool = None
 
-            # Check for reload flag (per-user or global)
-            if self._user_id > 0:
-                reload = auth.consume_user_session_reload(self._user_id)
-            else:
-                reload = auth.consume_session_reload()
-
-            if reload:
-                _logger.info("New Twitter session detected (user=%d) — reloading pool…", self._user_id)
+            current_version = auth.get_session_version()
+            if current_version != last_version:
+                last_version = current_version
+                _logger.info("Twitter session updated — reloading pool (user=%d)…", self._user_id)
                 continue
             break
 
         await db.close()
         self._state.is_monitoring = False
 
-    async def _watch_for_session_reload(self, scheduler: Scheduler) -> None:
+    async def _watch_for_session_reload(self, scheduler: Scheduler, baseline_version: int) -> None:
         while True:
             await asyncio.sleep(5)
-            if self._user_id > 0:
-                flag = auth.check_user_session_reload(self._user_id)
-            else:
-                flag = auth.check_session_reload()
-            if flag:
+            if auth.get_session_version() != baseline_version:
                 await scheduler.shutdown()
                 return
 

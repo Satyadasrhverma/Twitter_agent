@@ -24,118 +24,24 @@ _BASE_DIR         = os.path.dirname(os.path.abspath(__file__))
 SESSION_PATH      = os.path.join(_BASE_DIR, "data", "twitter_session.json")
 SESSION_META_PATH = SESSION_PATH + ".meta"
 
-# Flag set to True when a new session is freshly saved — MonitorThread polls this
-_session_reload_flag = False
-_reload_lock = threading.Lock()
-
-# Per-user reload flags: {user_id: bool}
-_user_reload_flags: dict[int, bool] = {}
-_user_reload_lock = threading.Lock()
-
-
-def get_user_session_path(user_id: int) -> str:
-    return os.path.join(_BASE_DIR, "data", "sessions", f"user_{user_id}", "twitter_session.json")
+# Twitter login is app-level and shared by every app-user (the admin connects
+# one account; everyone's monitoring reuses it). A version counter — rather
+# than a one-shot consume flag — lets multiple independent MonitorThreads
+# (one per app-user) each detect a new session without racing each other to
+# clear a single shared flag.
+_session_version = 0
+_version_lock = threading.Lock()
 
 
-def get_user_meta_path(user_id: int) -> str:
-    return get_user_session_path(user_id) + ".meta"
+def get_session_version() -> int:
+    with _version_lock:
+        return _session_version
 
 
-def session_exists_for(user_id: int) -> bool:
-    path = get_user_session_path(user_id)
-    if not os.path.exists(path):
-        return False
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        return any(c.get("name") == "auth_token" for c in data.get("cookies", []))
-    except Exception:
-        return False
-
-
-def get_session_username_for(user_id: int) -> Optional[str]:
-    meta = get_user_meta_path(user_id)
-    if os.path.exists(meta):
-        try:
-            with open(meta, encoding="utf-8") as f:
-                saved = json.load(f).get("username", "")
-            if saved and saved not in ("unknown", "imported"):
-                return saved
-        except Exception:
-            pass
-    return None
-
-
-def clear_session_for(user_id: int) -> None:
-    for path in (get_user_session_path(user_id), get_user_meta_path(user_id)):
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception:
-            pass
-    logger.info("Twitter session cleared for user %d", user_id)
-
-
-def check_user_session_reload(user_id: int) -> bool:
-    with _user_reload_lock:
-        return _user_reload_flags.get(user_id, False)
-
-
-def consume_user_session_reload(user_id: int) -> bool:
-    with _user_reload_lock:
-        if _user_reload_flags.get(user_id, False):
-            _user_reload_flags[user_id] = False
-            return True
-        return False
-
-
-def save_manual_cookies_for(auth_token: str, ct0: str, user_id: int) -> tuple[bool, str]:
-    auth_token = auth_token.strip()
-    ct0        = ct0.strip()
-    if not auth_token or not ct0:
-        return False, "auth_token aur ct0 dono required hain"
-
-    cookies_list = [
-        {"name": "auth_token", "value": auth_token, "domain": ".x.com",
-         "path": "/", "secure": True, "httpOnly": True, "sameSite": "None", "expires": -1},
-        {"name": "auth_token", "value": auth_token, "domain": ".twitter.com",
-         "path": "/", "secure": True, "httpOnly": True, "sameSite": "None", "expires": -1},
-        {"name": "ct0", "value": ct0, "domain": ".x.com",
-         "path": "/", "secure": True, "httpOnly": False, "sameSite": "Lax", "expires": -1},
-        {"name": "ct0", "value": ct0, "domain": ".twitter.com",
-         "path": "/", "secure": True, "httpOnly": False, "sameSite": "Lax", "expires": -1},
-    ]
-
-    path = get_user_session_path(user_id)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"cookies": cookies_list, "origins": []}, f)
-
-    username = _extract_username_from_cookies(cookies_list)
-    with open(get_user_meta_path(user_id), "w", encoding="utf-8") as f:
-        json.dump({"username": username or "unknown"}, f)
-
-    with _user_reload_lock:
-        _user_reload_flags[user_id] = True
-
-    logger.info("Manual cookies saved for user %d — twitter: %s", user_id, username)
-    return True, username or "unknown"
-
-
-def check_session_reload() -> bool:
-    """Return True if a new session was just saved (does NOT consume the flag)."""
-    with _reload_lock:
-        return _session_reload_flag
-
-
-def consume_session_reload() -> bool:
-    """Return True and clear the flag if a new session is waiting."""
-    global _session_reload_flag
-    with _reload_lock:
-        if _session_reload_flag:
-            _session_reload_flag = False
-            return True
-        return False
+def _bump_session_version() -> None:
+    global _session_version
+    with _version_lock:
+        _session_version += 1
 
 # ── Session helpers ──────────────────────────────────────────────────────────
 
@@ -483,10 +389,9 @@ def import_from_browser() -> tuple[bool, str]:
     with open(SESSION_META_PATH, "w", encoding="utf-8") as f:
         json.dump({"username": username or "imported"}, f)
 
-    global _session_reload_flag, _cached_username
+    global _cached_username
     _cached_username = None  # force re-resolve on next get_session_username() call
-    with _reload_lock:
-        _session_reload_flag = True
+    _bump_session_version()
 
     logger.info("Twitter session imported from %s (%d cookies)", imported_from, len(cookies_list))
     return True, imported_from
@@ -521,10 +426,9 @@ def save_manual_cookies(auth_token: str, ct0: str) -> tuple[bool, str]:
     with open(SESSION_META_PATH, "w", encoding="utf-8") as f:
         json.dump({"username": username or "unknown"}, f)
 
-    global _session_reload_flag, _cached_username
+    global _cached_username
     _cached_username = None
-    with _reload_lock:
-        _session_reload_flag = True
+    _bump_session_version()
 
     logger.info("Manual cookies saved — user: %s", username)
     return True, username or "unknown"
@@ -697,10 +601,8 @@ async def _do_login_async() -> dict:
         with open(SESSION_META_PATH, "w", encoding="utf-8") as f:
             json.dump({"username": username or "unknown"}, f)
 
-        # Signal MonitorThread to reload the browser pool with the new session
-        global _session_reload_flag
-        with _reload_lock:
-            _session_reload_flag = True
+        # Signal MonitorThread(s) to reload the browser pool with the new session
+        _bump_session_version()
 
         await context.close()
         logger.info("Login successful — session saved. User: %s", username)
